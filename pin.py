@@ -5,10 +5,186 @@ import cv2
 import numpy as np
 import json
 import os
+import sys
 import time
+import ctypes
 
 # ==========================================
-# 0. 自定义 UI 组件 (滑动开关)
+# 动态加载子目录中的 OPT SDK
+# ==========================================
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sdk_path = os.path.join(current_dir, "Python")
+
+if sdk_path not in sys.path:
+    sys.path.insert(0, sdk_path)
+
+if os.name == 'nt' and hasattr(os, 'add_dll_directory'):
+    if os.path.exists(sdk_path):
+        try:
+            os.add_dll_directory(sdk_path)
+        except Exception:
+            pass
+
+os.environ['PATH'] = sdk_path + os.pathsep + os.environ.get('PATH', '')
+
+SCICAM_AVAILABLE = False
+try:
+    from SciCam_class import *
+    SCICAM_AVAILABLE = True
+except ImportError as e:
+    print(f"警告: 无法在 '{sdk_path}' 中加载 OPT SDK。错误详情: {e}")
+
+# ==========================================
+# 0. OptCamera (OPT 工业相机驱动封装层)
+# ==========================================
+class OptCamera:
+    """
+    OPT（奥普特）工业相机驱动封装层
+    基于 SciCam SDK 实现，解决内存违规访问与指针生命周期问题。
+    """
+    def __init__(self):
+        if not SCICAM_AVAILABLE:
+            raise ImportError(f"未成功加载 OPT SDK。\n请确保 'SciCam_class.py' 及相关 dll 文件已放置在以下目录：\n{sdk_path}")
+
+        self._is_opened = False
+        self.m_cam = None
+        
+        # 将底层结构体作为实例属性，防止 Python 垃圾回收销毁指针引发 Access Violation
+        self._devInfos = None
+        self._devInfo = None
+        
+        step = "初始化相机实例"
+        try:
+            self.m_cam = SciCamera()
+            
+            step = "枚举设备(DiscoveryDevices)"
+            self._devInfos = SCI_DEVICE_INFO_LIST()
+            reVal = SciCamera.SciCam_DiscoveryDevices(self._devInfos, SciCamTLType.SciCam_TLType_Unkown)
+            if reVal != SCI_CAMERA_OK:
+                raise Exception(f"调用 API 失败，错误码: {reVal}")
+            if self._devInfos.count == 0:
+                raise Exception("未发现任何 OPT 相机设备，请检查连接线或电源。")
+                
+            step = "创建设备句柄(CreateDevice)"
+            self._devInfo = self._devInfos.pDevInfo[0]
+            reVal = self.m_cam.SciCam_CreateDevice(self._devInfo)
+            if reVal != SCI_CAMERA_OK:
+                raise Exception(f"调用 API 失败，错误码: {reVal}")
+                
+            time.sleep(0.2)  # 给硬件底层建立通讯留出缓冲时间
+                
+            step = "打开设备(OpenDevice)"
+            reVal = self.m_cam.SciCam_OpenDevice()
+            if reVal != SCI_CAMERA_OK:
+                raise Exception(f"调用 API 失败，错误码: {reVal}")
+                
+            time.sleep(0.2)  # 缓冲
+                
+            step = "开启拉流(StartGrabbing)"
+            reVal = self.m_cam.SciCam_StartGrabbing()
+            if reVal != SCI_CAMERA_OK:
+                raise Exception(f"调用 API 失败，错误码: {reVal}")
+                
+            self._is_opened = True
+            print("OPT 相机初始化并开启拉流成功！")
+            
+        except Exception as e:
+            if self.m_cam:
+                try:
+                    self.m_cam.SciCam_CloseDevice()
+                    self.m_cam.SciCam_DeleteDevice()
+                except:
+                    pass
+            self._is_opened = False
+            raise Exception(f"在【{step}】阶段发生异常:\n{str(e)}")
+
+    def isOpened(self):
+        return self._is_opened
+
+    def read(self):
+        if not self._is_opened:
+            return False, None
+            
+        # 每次读取必须声明全新的 c_void_p 指针对象，避免复用脏指针导致内存违规
+        ppayload = ctypes.c_void_p()
+            
+        try:
+            reVal = self.m_cam.SciCam_Grab(ppayload)
+            if reVal != SCI_CAMERA_OK:
+                return False, None
+                
+            payloadAttribute = SCI_CAM_PAYLOAD_ATTRIBUTE()
+            reVal = SciCam_Payload_GetAttribute(ppayload, payloadAttribute)
+            
+            if reVal != SCI_CAMERA_OK or not bool(payloadAttribute.isComplete):
+                self.m_cam.SciCam_FreePayload(ppayload)
+                return False, None
+                
+            imgAttr = payloadAttribute.imgAttr
+            imgPixelType = imgAttr.pixelType
+            imgWidth = imgAttr.width
+            imgHeight = imgAttr.height
+            
+            imgData = ctypes.c_void_p()
+            reVal = SciCam_Payload_GetImage(ppayload, imgData)
+            if reVal != SCI_CAMERA_OK:
+                self.m_cam.SciCam_FreePayload(ppayload)
+                return False, None
+
+            dstImgSize = ctypes.c_int()
+            frame = None
+            
+            is_mono = imgPixelType in [
+                SciCamPixelType.Mono1p, SciCamPixelType.Mono2p, SciCamPixelType.Mono4p,
+                SciCamPixelType.Mono8s, SciCamPixelType.Mono8, SciCamPixelType.Mono10,
+                SciCamPixelType.Mono10p, SciCamPixelType.Mono12, SciCamPixelType.Mono12p,
+                SciCamPixelType.Mono14, SciCamPixelType.Mono16, SciCamPixelType.Mono10Packed,
+                SciCamPixelType.Mono12Packed, SciCamPixelType.Mono14p
+            ]
+            
+            target_pixel_type = SciCamPixelType.Mono8 if is_mono else SciCamPixelType.RGB8
+            
+            reVal = SciCam_Payload_ConvertImage(imgAttr, imgData, target_pixel_type, None, dstImgSize, True)
+            if reVal == SCI_CAMERA_OK:
+                pDstData = (ctypes.c_ubyte * dstImgSize.value)()
+                reVal = SciCam_Payload_ConvertImage(imgAttr, imgData, target_pixel_type, pDstData, dstImgSize, True)
+                if reVal == SCI_CAMERA_OK:
+                    np_arr = np.ctypeslib.as_array(pDstData)
+                    if is_mono:
+                        frame = np_arr.reshape((imgHeight, imgWidth))
+                        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                    else:
+                        frame = np_arr.reshape((imgHeight, imgWidth, 3))
+                        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            
+            self.m_cam.SciCam_FreePayload(ppayload)
+            
+            if frame is not None:
+                return True, frame
+            return False, None
+            
+        except Exception as e:
+            print(f"OPT相机取图异常: {e}")
+            try:
+                self.m_cam.SciCam_FreePayload(ppayload)
+            except:
+                pass
+            return False, None
+
+    def release(self):
+        if self._is_opened and self.m_cam is not None:
+            try:
+                self.m_cam.SciCam_StopGrabbing()
+                self.m_cam.SciCam_CloseDevice()
+                self.m_cam.SciCam_DeleteDevice()
+            except Exception as e:
+                print(f"释放相机时发生异常: {e}")
+            finally:
+                self._is_opened = False
+                print("OPT 相机资源已释放")
+
+# ==========================================
+# 0.5. 自定义 UI 组件 (滑动开关)
 # ==========================================
 class SlideSwitch(tk.Canvas):
     def __init__(self, master, command=None, width=40, height=22, bg="#2E2E2E", **kwargs):
@@ -18,7 +194,6 @@ class SlideSwitch(tk.Canvas):
         self.width = width
         self.height = height
         
-        # 绘制背景圆角矩形和滑块
         self.rect = self.create_round_rect(2, 2, width-2, height-2, radius=10, fill="#777", outline="#777", tags="bg")
         self.knob = self.create_oval(4, 4, height-4, height-4, fill="white", outline="white", tags="knob")
         
@@ -42,7 +217,6 @@ class SlideSwitch(tk.Canvas):
         fill_color = "#4CAF50" if self.state else "#777"
         self.itemconfig(self.rect, fill=fill_color, outline=fill_color)
         
-        # 移动滑块
         move_x = self.width - self.height if self.state else 4
         self.coords(self.knob, move_x, 4, move_x + self.height - 8, self.height - 4)
         
@@ -51,7 +225,6 @@ class SlideSwitch(tk.Canvas):
 
     def set_state(self, state):
         self.toggle(force_state=state)
-
 
 # ==========================================
 # 1. ZoomableCanvas (画布组件)
@@ -169,7 +342,6 @@ class ZoomableCanvas(tk.Canvas):
         ix = (cx - self.offset_x) / self.scale
         iy = (cy - self.offset_y) / self.scale
         return int(ix), int(iy)
-
 
 # ==========================================
 # 2. VisionEngine (核心逻辑 - 双模板支持)
@@ -381,7 +553,6 @@ class VisionEngine:
         cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         return [cv2.boundingRect(c) for c in cnts if cv2.contourArea(c) >= a_min]
 
-
 # ==========================================
 # 3. 自动触发配置对话框
 # ==========================================
@@ -393,10 +564,8 @@ class AutoTriggerDialog(tk.Toplevel):
         self.configure(bg="#2E2E2E")
         self.callback = callback
         
-        # 传入的背景图
         self.cv_img = frame.copy() if frame is not None else np.zeros((480, 640, 3), dtype=np.uint8)
         
-        # 初始配置
         self.det_roi = current_config.get("det_roi", None)
         self.feat_roi = current_config.get("feat_roi", None)
         self.freq_val = tk.DoubleVar(value=current_config.get("freq", 1.0))
@@ -481,11 +650,10 @@ class AutoTriggerDialog(tk.Toplevel):
         
         if self.draw_mode == "det":
             self.det_roi = (x, y, w, h)
-            self.feat_roi = None # 如果重画检测区域，特征点失效
+            self.feat_roi = None 
             
         elif self.draw_mode == "feat":
             dx, dy, dw, dh = self.det_roi
-            # 校验是否在内部
             if x >= dx and y >= dy and x + w <= dx + dw and y + h <= dy + dh:
                 self.feat_roi = (x, y, w, h)
             else:
@@ -532,7 +700,6 @@ class AutoTriggerDialog(tk.Toplevel):
         self.callback(config)
         self.destroy()
 
-
 # ==========================================
 # 4. ModernUI (主界面集成)
 # ==========================================
@@ -540,12 +707,13 @@ class ModernUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.engine = VisionEngine()
-        self.title("PinCheck Pro - 双通道检测版")
+        self.title("Pin针偏位度检测(OPT)")
         self.geometry("1400x950")
         self.configure(bg="#2E2E2E")
         self._init_styles()
         
-        # --- 相机与自动触发状态 ---
+        self.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
         self.cap = None
         self.is_live = False
         self.latest_frame = None
@@ -557,9 +725,8 @@ class ModernUI(tk.Tk):
         self.auto_trigger_on = False
         self.last_check_time = 0
         self.last_trigger_time = 0
-        self.preview_live = True # 当取图后可暂停画面
+        self.preview_live = True 
 
-        # --- 原始数据 ---
         self.cv_img = None
         self.draw_mode = None
         self.rect_start = None
@@ -579,7 +746,6 @@ class ModernUI(tk.Tk):
         self._init_layout()
         self.canvas.bind("<<ViewChanged>>", self.redraw_overlays)
         
-        # 绑定 Enter 键触发取图
         self.bind('<Return>', self.capture_image)
 
     def _init_styles(self):
@@ -596,7 +762,6 @@ class ModernUI(tk.Tk):
         sidebar_container = ttk.Frame(self, width=320)
         sidebar_container.pack(side="left", fill="y", padx=5, pady=5)
         
-        # ---------------- 相机与自动触发模块 ----------------
         cam_frame = ttk.LabelFrame(sidebar_container, text="📷 相机与自动取图")
         cam_frame.pack(side="top", fill="x", pady=(0, 10))
         
@@ -615,7 +780,6 @@ class ModernUI(tk.Tk):
         
         ttk.Button(auto_row, text="⚙️ 设置", width=6, command=self.open_auto_config).pack(side="right")
         
-        # ---------------- 原始选项卡 ----------------
         self.sidebar = ttk.Notebook(sidebar_container)
         self.sidebar.pack(fill="both", expand=True)
         
@@ -683,19 +847,23 @@ class ModernUI(tk.Tk):
         tk.Scale(f, from_=0.1, to=1.0, res=0.05, orient="h", label="IOU 合格阈值", bg="#2E2E2E", fg="white", variable=self.var_iou_thresh).pack(fill="x")
         ttk.Button(f, text="🔍 开始检测", command=self.run_detection).pack(fill="x", pady=15)
 
-    # ==================== 相机控制模块 ====================
     def toggle_camera(self):
         if not self.is_live:
-            self.cap = cv2.VideoCapture(0)
-            if not self.cap.isOpened():
-                messagebox.showerror("相机错误", "无法打开摄像头！")
+            try:
+                self.cap = OptCamera()
+            except Exception as e:
+                messagebox.showerror("相机连接失败", str(e))
                 return
+                
+            if not self.cap.isOpened():
+                messagebox.showerror("相机错误", "无法连接到 OPT 相机！\n请检查设备连接或 SDK 驱动是否正常。")
+                return
+                
             self.is_live = True
             self.preview_live = True
             self.btn_cam.config(text="关闭相机/恢复实时")
             self.update_camera()
         else:
-            # 点击后如果是处于暂停状态（取过图），则恢复实时流
             if not self.preview_live:
                 self.preview_live = True
                 self.lbl_status.config(text="已恢复实时预览")
@@ -708,19 +876,15 @@ class ModernUI(tk.Tk):
                 self.lbl_status.config(text="相机已关闭")
 
     def update_camera(self):
-        if self.is_live and self.cap.isOpened():
+        if self.is_live and self.cap and self.cap.isOpened():
             ret, frame = self.cap.read()
             if ret:
                 self.latest_frame = frame
                 
-                # ------ 自动触发检测 ------
                 if self.auto_trigger_on and self.auto_config["feat_tpl_gray"] is not None and self.auto_config["det_roi"] is not None:
                     now = time.time()
-                    # 检查频率
                     if now - self.last_check_time >= (1.0 / self.auto_config["freq"]):
                         self.last_check_time = now
-                        
-                        # 设置2秒冷却时间，防止一直疯狂触发
                         if now - self.last_trigger_time > 2.0:
                             dx, dy, dw, dh = self.auto_config["det_roi"]
                             det_img = frame[dy:dy+dh, dx:dx+dw]
@@ -729,7 +893,6 @@ class ModernUI(tk.Tk):
                                 gray_det = cv2.cvtColor(det_img, cv2.COLOR_BGR2GRAY)
                                 tpl = self.auto_config["feat_tpl_gray"]
                                 
-                                # 防止尺寸不符
                                 if gray_det.shape[0] >= tpl.shape[0] and gray_det.shape[1] >= tpl.shape[1]:
                                     res = cv2.matchTemplate(gray_det, tpl, cv2.TM_CCOEFF_NORMED)
                                     _, max_val, _, _ = cv2.minMaxLoc(res)
@@ -738,7 +901,6 @@ class ModernUI(tk.Tk):
                                         self.last_trigger_time = now
                                         self.capture_image()
                 
-                # 如果处于实时预览态，则将画面传给Canvas
                 if self.preview_live:
                     self.cv_img = frame.copy()
                     self.canvas.swap_image(self.cv_img)
@@ -752,16 +914,13 @@ class ModernUI(tk.Tk):
             
         self.cv_img = self.latest_frame.copy()
         
-        # 若是相机实时流，则暂停界面更新（内部流依然运转以支持下次匹配）
         if self.is_live:
             self.preview_live = False
             
-        # 使用 load_image 重置试图（或者也可以用swap_image）
         self.canvas.load_image(self.cv_img)
         self.redraw_overlays()
         self.lbl_status.config(text="已成功取图，预览画面已锁定（点击相机按钮恢复）。")
 
-        # 【核心逻辑：自动触发检测】
         if self.sidebar.index("current") == 1:
             self.run_detection()
 
@@ -782,14 +941,11 @@ class ModernUI(tk.Tk):
 
     def save_auto_config(self, config):
         self.auto_config.update(config)
-        # 裁剪出特征点模板并转为灰度图保存至内存，供 matchTemplate 使用
         fx, fy, fw, fh = config["feat_roi"]
         feat_img_bgr = self.latest_frame[fy:fy+fh, fx:fx+fw]
         self.auto_config["feat_tpl_gray"] = cv2.cvtColor(feat_img_bgr, cv2.COLOR_BGR2GRAY)
         self.lbl_status.config(text="自动触发配置保存成功！")
 
-
-    # ==================== 原有的 UI 操作 ====================
     def on_tab_changed(self, e):
         self.draw_mode = None
         self.lbl_status.config(text="模式切换")
@@ -811,7 +967,7 @@ class ModernUI(tk.Tk):
         p = filedialog.askopenfilename()
         if p:
             self.cv_img = cv2.imread(p)
-            self.latest_frame = self.cv_img.copy() # 同步一下用于配置
+            self.latest_frame = self.cv_img.copy() 
             self.canvas.load_image(self.cv_img)
             self.clear_tmpl_boxes()
 
@@ -886,7 +1042,6 @@ class ModernUI(tk.Tk):
         except Exception as e:
             messagebox.showerror("Err", str(e))
 
-    # ==================== 绘图事件 ====================
     def on_down(self, e):
         if not self.draw_mode: return
         self.rect_start = self.canvas.canvas2img(e.x, e.y)
@@ -970,6 +1125,11 @@ class ModernUI(tk.Tk):
     def _text(self, x, y, txt, c):
         cx, cy = self.canvas.img2canvas(x, y)
         self.canvas.create_text(cx, cy, text=txt, fill=c, anchor="sw", font=("Arial", 10, "bold"), tags="overlay")
+
+    def on_closing(self):
+        if hasattr(self, 'cap') and self.cap:
+            self.cap.release()
+        self.destroy()
 
 if __name__ == "__main__":
     app = ModernUI()
