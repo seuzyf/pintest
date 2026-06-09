@@ -12,8 +12,15 @@ logger = logging.getLogger("CameraManager")
 # ==========================================
 # 动态加载子目录中的 OPT SDK
 # ==========================================
-current_dir = os.path.dirname(os.path.abspath(__file__))
-sdk_path = os.path.join(current_dir, "Python")
+# 判断是否被 PyInstaller 打包
+if getattr(sys, 'frozen', False):
+    # 打包模式：SDK 位于临时目录 sys._MEIPASS 中
+    base_dir = sys._MEIPASS
+else:
+    # 开发模式：SDK 位于当前脚本所在目录
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+
+sdk_path = os.path.join(base_dir, "Python")
 
 if sdk_path not in sys.path:
     sys.path.insert(0, sdk_path)
