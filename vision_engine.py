@@ -78,13 +78,13 @@ class VisionEngine:
         arr = np.frombuffer(buf, np.uint8)
         return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
-    def calculate_iou(self, boxA, boxB):
-        boxA = [boxA[0], boxA[1], boxA[0]+boxA[2], boxA[1]+boxA[3]]
-        boxB = [boxB[0], boxB[1], boxB[0]+boxB[2], boxB[1]+boxB[3]]
-        xA, yA = max(boxA[0], boxB[0]), max(boxA[1], boxB[1])
-        xB, yB = min(boxA[2], boxB[2]), min(boxA[3], boxB[3])
-        interArea = max(0, xB - xA) * max(0, yB - yA)
-        return interArea / float((boxA[2]-boxA[0])*(boxA[3]-boxA[1]) + (boxB[2]-boxB[0])*(boxB[3]-boxB[1]) - interArea + 1e-6)
+    def calculate_center_distance(self, boxA, boxB):
+        """计算两个边界框中心点之间的欧氏距离"""
+        cA_x = boxA[0] + boxA[2] / 2.0
+        cA_y = boxA[1] + boxA[3] / 2.0
+        cB_x = boxB[0] + boxB[2] / 2.0
+        cB_y = boxB[1] + boxB[3] / 2.0
+        return float(np.sqrt((cA_x - cB_x)**2 + (cA_y - cB_y)**2))
 
     def process_all_templates(self, img, all_boxes, params):
         self.preview_results = []
@@ -180,7 +180,7 @@ class VisionEngine:
         n = len(self.marks)
         return True, (avg_dx // n, avg_dy // n)
 
-    def detect_batch_process(self, img, rois_with_ids, iou_thresh, offset=(0,0)):
+    def detect_batch_process(self, img, rois_with_ids, dist_thresh, pixel_size, offset=(0,0)):
         self.detect_results = []
         ox, oy = offset
         logger.info(f"开始批量检测，接收到 {len(rois_with_ids)} 个检测框，偏移量 {offset}")
@@ -225,16 +225,18 @@ class VisionEngine:
                 roi_search = img[sy:sy+sh, sx:sx+sw]
                 cands = self._find_pins(roi_search, params['thresh_min'], params['thresh_max'], params['area_min'])
                 
-                final_box, iou = None, 0.0
+                final_box, dist_um = None, float('inf')
                 if cands:
                     pred_rel = (pred_box[0]-sx, pred_box[1]-sy, pred_box[2], pred_box[3])
-                    best_c = max(cands, key=lambda c: self.calculate_iou(pred_rel, c))
-                    iou = self.calculate_iou(pred_rel, best_c)
+                    # 匹配中心点距离最小的候选框
+                    best_c = min(cands, key=lambda c: self.calculate_center_distance(pred_rel, c))
+                    pixel_dist = self.calculate_center_distance(pred_rel, best_c)
+                    dist_um = pixel_dist * pixel_size
                     final_box = (sx + best_c[0], sy + best_c[1], best_c[2], best_c[3])
                 
                 prod_res['pins'].append({
                     'pred_box': pred_box, 'actual_box': final_box,
-                    'iou': iou, 'status': 'pass' if iou >= iou_thresh else 'fail'
+                    'dist': dist_um, 'status': 'pass' if dist_um <= dist_thresh else 'fail'
                 })
             self.detect_results.append(prod_res)
         return self.detect_results

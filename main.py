@@ -28,6 +28,46 @@ from vision_engine import VisionEngine
 # ==========================================
 # 自定义 UI 组件
 # ==========================================
+
+class ScrollableFrame(ttk.Frame):
+    """支持鼠标滚轮和滚动条的容器面板"""
+    def __init__(self, container, *args, **kwargs):
+        super().__init__(container, *args, **kwargs)
+        self.canvas = tk.Canvas(self, bg="#2E2E2E", highlightthickness=0)
+        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.scrollable_frame = ttk.Frame(self.canvas)
+
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.canvas.configure(
+                scrollregion=self.canvas.bbox("all")
+            )
+        )
+
+        self.window_id = self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        
+        # 保证内部 frame 宽度跟随 canvas 变化
+        self.canvas.bind(
+            '<Configure>', 
+            lambda e: self.canvas.itemconfig(self.window_id, width=e.width)
+        )
+
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.scrollbar.pack(side="right", fill="y")
+
+    def update_scroll_bindings(self):
+        """递归绑定鼠标滚轮事件到所有子组件，以确保在控件上滚动不失效"""
+        def _on_mousewheel(event):
+            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        
+        def bind_tree(widget):
+            widget.bind("<MouseWheel>", _on_mousewheel)
+            for child in widget.winfo_children():
+                bind_tree(child)
+                
+        bind_tree(self.canvas)
+
 class SlideSwitch(tk.Canvas):
     def __init__(self, master, command=None, width=40, height=22, bg="#2E2E2E", **kwargs):
         super().__init__(master, width=width, height=height, bg=bg, highlightthickness=0, **kwargs)
@@ -180,7 +220,20 @@ class ModernUI(tk.Tk):
         self.test_rois = []
         
         self.var_preview_mode = tk.BooleanVar(value=False)
-        self.var_iou_thresh = tk.DoubleVar(value=0.5)
+        self.var_dist_thresh = tk.DoubleVar(value=50.0)
+        self.var_pixel_size = tk.DoubleVar(value=5.0)
+        
+        self.var_save_path = tk.StringVar(value="")
+        self.var_task_order = tk.StringVar(value="")
+        self.var_emp_id = tk.StringVar(value="")
+        self.current_sn = ""
+        self.sn_window = None
+
+        # --- 新增统计变量 ---
+        self.stats_task_order = ""
+        self.stats_ok_count = 0
+        self.stats_ng_count = 0
+        self.stats_total_count = 0
 
         self._init_layout()
         self.canvas.bind("<<ViewChanged>>", self.redraw_overlays)
@@ -209,17 +262,32 @@ class ModernUI(tk.Tk):
         self.sidebar = ttk.Notebook(sidebar_container)
         self.sidebar.pack(fill="both", expand=True)
         
-        self.tab_template = ttk.Frame(self.sidebar)
+        # 将原有直接绑定的 frame 替换为 ScrollableFrame 容器
+        self.tab_template = ScrollableFrame(self.sidebar)
         self.sidebar.add(self.tab_template, text="1. 双模板制作")
-        self._init_tab_template(self.tab_template)
+        self._init_tab_template(self.tab_template.scrollable_frame)
         
-        self.tab_detect = ttk.Frame(self.sidebar)
+        self.tab_detect = ScrollableFrame(self.sidebar)
         self.sidebar.add(self.tab_detect, text="2. 批量检测")
-        self._init_tab_detect(self.tab_detect)
+        self._init_tab_detect(self.tab_detect.scrollable_frame)
         
         self.sidebar.bind("<<NotebookTabChanged>>", self.on_tab_changed)
-        self.lbl_status = ttk.Label(self, text="就绪", wraplength=1000, font=("Segoe UI", 11, "bold"))
-        self.lbl_status.pack(side="bottom", fill="x", padx=10, pady=5)
+        
+        # 初始化滚动事件绑定
+        self.after(100, lambda: self.tab_template.update_scroll_bindings())
+        self.after(100, lambda: self.tab_detect.update_scroll_bindings())
+
+        # --- 修改底部状态栏布局 ---
+        self.status_bar_frame = ttk.Frame(self)
+        self.status_bar_frame.pack(side="bottom", fill="x", padx=10, pady=5)
+        
+        # 左侧保留原有的提示信息
+        self.lbl_status = ttk.Label(self.status_bar_frame, text="就绪", wraplength=800, font=("Segoe UI", 11, "bold"))
+        self.lbl_status.pack(side="left", fill="x", expand=True)
+
+        # 右侧新增专属的统计信息显示栏
+        self.lbl_stats = ttk.Label(self.status_bar_frame, text="统计: 暂无数据", font=("Segoe UI", 11, "bold"), foreground="#4CAF50")
+        self.lbl_stats.pack(side="right", padx=(10, 0))
 
         self.canvas = ZoomableCanvas(self, bg="#1E1E1E")
         self.canvas.pack(side="right", fill="both", expand=True)
@@ -267,6 +335,29 @@ class ModernUI(tk.Tk):
         
         ttk.Separator(f).pack(fill="x", pady=10)
         
+        # --- 数据存储与任务令设置 ---
+        path_lf = ttk.LabelFrame(f, text=" 检测数据存储设置 ")
+        path_lf.pack(fill="x", pady=5)
+        
+        task_emp_frame = ttk.Frame(path_lf)
+        task_emp_frame.pack(fill="x", padx=5, pady=(5, 2))
+        
+        ttk.Label(task_emp_frame, text="任务令:").pack(side="left")
+        ttk.Entry(task_emp_frame, textvariable=self.var_task_order, width=12).pack(side="left", padx=(2, 10))
+        
+        ttk.Label(task_emp_frame, text="测试员工号:").pack(side="left")
+        ttk.Entry(task_emp_frame, textvariable=self.var_emp_id, width=10).pack(side="left", padx=(2, 0))
+
+        ttk.Button(path_lf, text="📁 设置根保存路径", command=self.select_save_path).pack(fill="x", padx=5, pady=2)
+        ttk.Label(path_lf, textvariable=self.var_save_path, foreground="#AAA").pack(fill="x", padx=5, pady=(0,5))
+        
+        # --- 扫码触发检测 ---
+        sn_lf = ttk.LabelFrame(f, text=" 扫码触发检测 (SN输入) ")
+        sn_lf.pack(fill="x", pady=5)
+        ttk.Button(sn_lf, text="🔍 扫码枪输入 SN (弹窗)", command=self.open_sn_dialog).pack(fill="x", padx=5, pady=5)
+
+        ttk.Separator(f).pack(fill="x", pady=10)
+        
         auto_lf = ttk.LabelFrame(f, text=" 自动触发检测 (需Mark点) ")
         auto_lf.pack(fill="x", pady=5)
         
@@ -292,7 +383,22 @@ class ModernUI(tk.Tk):
         ttk.Button(f, text="🗑️ 清除当前框", command=self.clear_test_boxes).pack(fill="x", pady=5)
         
         ttk.Separator(f).pack(fill="x", pady=10)
-        tk.Scale(f, from_=0.1, to=1.0, res=0.05, orient="h", label="IOU 合格阈值", bg="#2E2E2E", fg="white", variable=self.var_iou_thresh).pack(fill="x")
+        
+        param_f = ttk.Frame(f)
+        param_f.pack(fill="x", pady=10)
+        
+        # 偏移合格阈值输入框
+        dist_f = ttk.Frame(param_f)
+        dist_f.pack(side="left", padx=(0, 10))
+        ttk.Label(dist_f, text="偏移合格阈值(um):").pack(side="left")
+        ttk.Entry(dist_f, textvariable=self.var_dist_thresh, width=6).pack(side="left", padx=(2,0))
+        
+        # 单像素物理距离输入框
+        px_f = ttk.Frame(param_f)
+        px_f.pack(side="left")
+        ttk.Label(px_f, text="单像素距离(um):").pack(side="left")
+        ttk.Entry(px_f, textvariable=self.var_pixel_size, width=6).pack(side="left", padx=(2,0))
+
         ttk.Button(f, text="🔍 开始手动检测", command=self.run_detection).pack(fill="x", pady=15)
 
     def toggle_camera(self):
@@ -379,7 +485,7 @@ class ModernUI(tk.Tk):
         self.trigger_waiting = False
         self.trigger_cooldown = True
 
-    def capture_image(self, event=None):
+    def capture_image(self, event=None, skip_detect=False):
         if self.latest_frame is None:
             messagebox.showwarning("提示", "当前没有图像，请先加载图片或打开相机")
             return
@@ -393,8 +499,156 @@ class ModernUI(tk.Tk):
             logger.info("用户手动截取图像")
             self.lbl_status.config(text="已手动取图，预览画面已锁定（点击相机按钮恢复）。")
 
-        if self.sidebar.index("current") == 1 and not self.auto_trigger_on:
+        if self.sidebar.index("current") == 1 and not self.auto_trigger_on and not skip_detect:
             self.run_detection()
+
+    # ==========================================
+    # SN扫描与自动图片保存控制逻辑 (基于任务令)
+    # ==========================================
+    def select_save_path(self):
+        path = filedialog.askdirectory(title="选择检测图片保存根路径")
+        if path:
+            self.var_save_path.set(path)
+            logger.info(f"图片自动保存根路径已设置为: {path}")
+
+    def open_sn_dialog(self):
+        if not self.test_rois:
+            messagebox.showwarning("警告", "请先绘制或加载待测区，再开启扫码检测！")
+            return
+
+        if self.sn_window and self.sn_window.winfo_exists():
+            self.sn_window.focus_set()
+            return
+
+        self.sn_window = tk.Toplevel(self)
+        self.sn_window.title("SN扫码输入")
+        self.sn_window.geometry("400x130")
+        self.sn_window.attributes("-topmost", True)
+        self.sn_window.transient(self) 
+
+        ttk.Label(self.sn_window, text="请使用扫码枪扫描SN (自动回车触发):", font=("Segoe UI", 11)).pack(pady=10)
+        self.sn_entry = ttk.Entry(self.sn_window, font=("Segoe UI", 14))
+        self.sn_entry.pack(fill="x", padx=20, pady=5)
+        self.sn_entry.focus_set()
+        
+        self.sn_entry.bind('<Return>', self.on_sn_entered)
+
+    def on_sn_entered(self, event):
+        self.current_sn = self.sn_entry.get().strip()
+        self.sn_window.destroy()
+        self.after(100, self.trigger_sn_detection)
+
+    def trigger_sn_detection(self):
+        self.capture_image(skip_detect=True)
+        if self.cv_img is None:
+            messagebox.showerror("错误", "未能获取图像，请检查相机状态")
+            self.current_sn = ""
+            return
+
+        is_ok = self.run_detection()
+
+        if is_ok:
+            self.lbl_status.config(text=f"[{self.current_sn}] 检测OK。请扫描下一个。")
+            self.current_sn = ""
+            self.after(500, self.open_sn_dialog)
+        else:
+            self.lbl_status.config(text=f"[{self.current_sn}] 检测NG！需要人工确认！")
+            messagebox.showwarning("检测 NG", f"SN: {self.current_sn}\n\n该产品检测出不良 (NG) 或出现错误，请手动确认！")
+            self.current_sn = ""
+            self.after(500, self.open_sn_dialog)
+
+    def save_detection_images(self, is_ok):
+        save_path = self.var_save_path.get()
+        if not save_path or not os.path.exists(save_path):
+            return
+
+        task_order = self.var_task_order.get().strip()
+        if not task_order:
+            task_order = "未命名任务"
+
+        # 根据任务令在根目录下创建子文件夹
+        task_dir = os.path.join(save_path, task_order)
+        raw_dir = os.path.join(task_dir, "raw")
+        ok_dir = os.path.join(task_dir, "ok")
+        ng_dir = os.path.join(task_dir, "ng")
+
+        for d in [raw_dir, ok_dir, ng_dir]:
+            os.makedirs(d, exist_ok=True)
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        sn_str = getattr(self, 'current_sn', '')
+        file_name = f"{sn_str}_{ts}.jpg" if sn_str else f"{ts}.jpg"
+
+        # 1. 保存原始整版图
+        raw_path = os.path.join(raw_dir, file_name)
+        cv2.imwrite(raw_path, self.cv_img)
+
+        # 2. 绘制包含结果的图片
+        res_img = self.cv_img.copy()
+
+        for (x, y, w, h, tid) in self.test_rois:
+            color = (255, 255, 0) if tid == '1' else (255, 0, 255)
+            cv2.rectangle(res_img, (x, y), (x+w, y+h), color, 1)
+            cv2.putText(res_img, f"T{tid}", (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
+
+        for res in self.engine.detect_results:
+            if res['type'] in ['error', 'frame_fail']:
+                bx, by, bw, bh = res['box']
+                cv2.rectangle(res_img, (bx, by), (bx+bw, by+bh), (0, 0, 255), 2)
+                cv2.putText(res_img, "Fail", (bx, by-5), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            elif res['type'] == 'product':
+                fx, fy, fw, fh = res['frame_box']
+                cv2.rectangle(res_img, (fx, fy), (fx+fw, fy+fh), (255, 0, 0), 1)
+                for p in res['pins']:
+                    c = (0, 255, 0) if p['status'] == 'pass' else (0, 0, 255)
+                    px, py, pw, ph = p['pred_box']
+                    cv2.rectangle(res_img, (px, py), (px+pw, py+ph), (0, 255, 255), 1)
+                    if p['actual_box']:
+                        ax, ay, aw, ah = p['actual_box']
+                        cv2.rectangle(res_img, (ax, ay), (ax+aw, ay+ah), c, 2)
+                        cv2.putText(res_img, f"{p['dist']:.1f}um", (ax, ay-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, c, 1)
+                    else:
+                        cv2.putText(res_img, "Lost", (px, py-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+
+        # 3. 按最终判定存入 OK 或 NG 目录
+        target_dir = ok_dir if is_ok else ng_dir
+        res_path = os.path.join(target_dir, file_name)
+        cv2.imwrite(res_path, res_img)
+        
+        emp_id = self.var_emp_id.get().strip()
+        logger.info(f"图片自动归档完成 (任务令: {task_order}, 员工号: {emp_id if emp_id else '无'}): {file_name} -> {target_dir}")
+        
+    # ==========================================
+
+    def update_task_stats(self, is_ok):
+        """更新当前任务令的统计情况"""
+        current_task = self.var_task_order.get().strip()
+        if not current_task:
+            current_task = "未命名任务"
+            
+        # 如果任务令发生变更，重置统计数据
+        if current_task != self.stats_task_order:
+            self.stats_task_order = current_task
+            self.stats_ok_count = 0
+            self.stats_ng_count = 0
+            self.stats_total_count = 0
+            
+        self.stats_total_count += 1
+        if is_ok:
+            self.stats_ok_count += 1
+        else:
+            self.stats_ng_count += 1
+            
+        emp_id = self.var_emp_id.get().strip()
+        emp_info = f", 测试员工号: {emp_id}" if emp_id else ""
+        
+        stats_text = f"任务: {self.stats_task_order} | OK: {self.stats_ok_count} | NG: {self.stats_ng_count} | 总计: {self.stats_total_count}"
+        
+        # 更新状态栏右侧统计显示
+        self.lbl_stats.config(text=stats_text)
+        
+        # 记录到日志系统
+        logger.info(f"【测试统计】{stats_text}{emp_info}")
 
     def on_auto_switch(self, state):
         if state and not self.engine.marks:
@@ -523,18 +777,38 @@ class ModernUI(tk.Tk):
         self.redraw_overlays()
 
     def run_detection(self, offset=(0,0)):
-        if self.cv_img is None or not self.test_rois: return
+        if self.cv_img is None or not self.test_rois: return False
         try:
-            res = self.engine.detect_batch_process(self.cv_img, self.test_rois, self.var_iou_thresh.get(), offset=offset)
+            res = self.engine.detect_batch_process(
+                self.cv_img, 
+                self.test_rois, 
+                dist_thresh=self.var_dist_thresh.get(), 
+                pixel_size=self.var_pixel_size.get(), 
+                offset=offset
+            )
             self.redraw_overlays()
             ok_cnt = sum(1 for r in res if r['type']=='product' and all(p['status']=='pass' for p in r['pins']))
+            
+            is_all_ok = (len(res) > 0 and ok_cnt == len(res))
+            
             result_txt = f"检测完成 | 全部OK的产品数: {ok_cnt} / {len(res)}"
             logger.info(result_txt)
-            if not self.auto_trigger_on:
+            
+            # 保存图片归档
+            self.save_detection_images(is_all_ok)
+            
+            # 同步更新统计情况
+            self.update_task_stats(is_all_ok)
+            
+            # 不影响原有的手动测试/非扫码状态显示
+            if not getattr(self, 'current_sn', '') and not self.auto_trigger_on:
                 self.lbl_status.config(text=result_txt)
+                
+            return is_all_ok
         except Exception as e:
             logger.error(f"检测报错: {e}")
             messagebox.showerror("Err", str(e))
+            return False
 
     def on_down(self, e):
         if not self.draw_mode: return
@@ -610,7 +884,7 @@ class ModernUI(tk.Tk):
                         self._rect(p['pred_box'], "yellow", 1, dash=(2,2))
                         if p['actual_box']:
                             self._rect(p['actual_box'], c, 2)
-                            self._text(p['actual_box'][0], p['actual_box'][1]-10, f"{p['iou']:.2f}", c)
+                            self._text(p['actual_box'][0], p['actual_box'][1]-10, f"{p['dist']:.1f}um", c)
                         else:
                             self._text(p['pred_box'][0], p['pred_box'][1], "Lost", "red")
 
