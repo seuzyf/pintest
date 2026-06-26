@@ -2,14 +2,14 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 import cv2
+import numpy as np
 import os
 import time
+import json
 import logging
 from datetime import datetime
 
-# ==========================================
 # 初始化全局日志系统
-# ==========================================
 log_filename = f"pintest_{datetime.now().strftime('%Y%m%d')}.log"
 logging.basicConfig(
     level=logging.INFO,
@@ -21,16 +21,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("MainUI")
 
-# 引入已解耦的核心模块
 from camera_manager import OptCamera
 from vision_engine import VisionEngine
 
-# ==========================================
-# 自定义 UI 组件
-# ==========================================
-
 class ScrollableFrame(ttk.Frame):
-    """支持鼠标滚轮和滚动条的容器面板"""
     def __init__(self, container, *args, **kwargs):
         super().__init__(container, *args, **kwargs)
         self.canvas = tk.Canvas(self, bg="#2E2E2E", highlightthickness=0)
@@ -45,59 +39,20 @@ class ScrollableFrame(ttk.Frame):
         )
 
         self.window_id = self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
-        
-        # 保证内部 frame 宽度跟随 canvas 变化
-        self.canvas.bind(
-            '<Configure>', 
-            lambda e: self.canvas.itemconfig(self.window_id, width=e.width)
-        )
+        self.canvas.bind('<Configure>', lambda e: self.canvas.itemconfig(self.window_id, width=e.width))
 
         self.canvas.configure(yscrollcommand=self.scrollbar.set)
         self.canvas.pack(side="left", fill="both", expand=True)
         self.scrollbar.pack(side="right", fill="y")
 
     def update_scroll_bindings(self):
-        """递归绑定鼠标滚轮事件到所有子组件，以确保在控件上滚动不失效"""
         def _on_mousewheel(event):
             self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        
         def bind_tree(widget):
             widget.bind("<MouseWheel>", _on_mousewheel)
             for child in widget.winfo_children():
                 bind_tree(child)
-                
         bind_tree(self.canvas)
-
-class SlideSwitch(tk.Canvas):
-    def __init__(self, master, command=None, width=40, height=22, bg="#2E2E2E", **kwargs):
-        super().__init__(master, width=width, height=height, bg=bg, highlightthickness=0, **kwargs)
-        self.state = False
-        self.command = command
-        self.width = width
-        self.height = height
-        self.rect = self.create_round_rect(2, 2, width-2, height-2, radius=10, fill="#777", outline="#777", tags="bg")
-        self.knob = self.create_oval(4, 4, height-4, height-4, fill="white", outline="white", tags="knob")
-        self.bind("<Button-1>", self.toggle)
-        self.tag_bind("bg", "<Button-1>", self.toggle)
-        self.tag_bind("knob", "<Button-1>", self.toggle)
-
-    def create_round_rect(self, x1, y1, x2, y2, radius=25, **kwargs):
-        points = [x1+radius, y1, x1+radius, y1, x2-radius, y1, x2-radius, y1, x2, y1, x2, y1+radius,
-                  x2, y1+radius, x2, y2-radius, x2, y2-radius, x2, y2, x2-radius, y2, x2-radius, y2,
-                  x1+radius, y2, x1+radius, y2, x1, y2, x1, y2-radius, x1, y2-radius, x1, y1+radius,
-                  x1, y1+radius, x1, y1]
-        return self.create_polygon(points, smooth=True, **kwargs)
-
-    def toggle(self, event=None, force_state=None):
-        if force_state is not None: self.state = force_state
-        else: self.state = not self.state
-        fill_color = "#4CAF50" if self.state else "#777"
-        self.itemconfig(self.rect, fill=fill_color, outline=fill_color)
-        move_x = self.width - self.height if self.state else 4
-        self.coords(self.knob, move_x, 4, move_x + self.height - 8, self.height - 4)
-        if self.command and force_state is None: self.command(self.state)
-
-    def set_state(self, state): self.toggle(force_state=state)
 
 class ZoomableCanvas(tk.Canvas):
     def __init__(self, master, **kwargs):
@@ -182,10 +137,6 @@ class ZoomableCanvas(tk.Canvas):
     def img2canvas(self, ix, iy): return ix * self.scale + self.offset_x, iy * self.scale + self.offset_y
     def canvas2img(self, cx, cy): return int((cx - self.offset_x) / self.scale), int((cy - self.offset_y) / self.scale)
 
-
-# ==========================================
-# 主界面类
-# ==========================================
 class ModernUI(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -206,6 +157,9 @@ class ModernUI(tk.Tk):
         self.preview_live = True 
         self.trigger_waiting = False
         self.trigger_cooldown = False
+        
+        self.showing_result = False
+        self.last_move_check_time = 0
 
         self.cv_img = None
         self.draw_mode = None
@@ -227,9 +181,12 @@ class ModernUI(tk.Tk):
         self.var_task_order = tk.StringVar(value="")
         self.var_emp_id = tk.StringVar(value="")
         self.current_sn = ""
+        
         self.sn_window = None
+        # --- 新增记忆扫码框绝对坐标 ---
+        self.sn_window_x = None
+        self.sn_window_y = None
 
-        # --- 新增统计变量 ---
         self.stats_task_order = ""
         self.stats_ok_count = 0
         self.stats_ng_count = 0
@@ -262,7 +219,6 @@ class ModernUI(tk.Tk):
         self.sidebar = ttk.Notebook(sidebar_container)
         self.sidebar.pack(fill="both", expand=True)
         
-        # 将原有直接绑定的 frame 替换为 ScrollableFrame 容器
         self.tab_template = ScrollableFrame(self.sidebar)
         self.sidebar.add(self.tab_template, text="1. 双模板制作")
         self._init_tab_template(self.tab_template.scrollable_frame)
@@ -273,19 +229,15 @@ class ModernUI(tk.Tk):
         
         self.sidebar.bind("<<NotebookTabChanged>>", self.on_tab_changed)
         
-        # 初始化滚动事件绑定
         self.after(100, lambda: self.tab_template.update_scroll_bindings())
         self.after(100, lambda: self.tab_detect.update_scroll_bindings())
 
-        # --- 修改底部状态栏布局 ---
         self.status_bar_frame = ttk.Frame(self)
         self.status_bar_frame.pack(side="bottom", fill="x", padx=10, pady=5)
         
-        # 左侧保留原有的提示信息
         self.lbl_status = ttk.Label(self.status_bar_frame, text="就绪", wraplength=800, font=("Segoe UI", 11, "bold"))
         self.lbl_status.pack(side="left", fill="x", expand=True)
 
-        # 右侧新增专属的统计信息显示栏
         self.lbl_stats = ttk.Label(self.status_bar_frame, text="统计: 暂无数据", font=("Segoe UI", 11, "bold"), foreground="#4CAF50")
         self.lbl_stats.pack(side="right", padx=(10, 0))
 
@@ -319,12 +271,38 @@ class ModernUI(tk.Tk):
         self.s_max = tk.Scale(f, from_=0, to=255, orient="h", label="Max Thresh", bg="#2E2E2E", fg="white", command=self.upd_view); self.s_max.set(255); self.s_max.pack(fill="x")
         self.s_area = tk.Scale(f, from_=1, to=100, orient="h", label="Min Area", bg="#2E2E2E", fg="white"); self.s_area.set(10); self.s_area.pack(fill="x")
         
+        # --- 增设基准边最小连续宽度限制 ---
+        self.s_edge_min_len = tk.Scale(f, from_=1, to=200, orient="h", label="找边最小连续限制 (像素数)", bg="#2E2E2E", fg="white", command=self.upd_view)
+        self.s_edge_min_len.set(20)
+        self.s_edge_min_len.pack(fill="x")
+        
+        param_f = ttk.Frame(f)
+        param_f.pack(fill="x", pady=5)
+        
+        dist_f = ttk.Frame(param_f)
+        dist_f.pack(side="left", padx=(0, 10))
+        ttk.Label(dist_f, text="偏移合格阈值(um):").pack(side="left")
+        ttk.Entry(dist_f, textvariable=self.var_dist_thresh, width=6).pack(side="left", padx=(2,0))
+        
+        px_f = ttk.Frame(param_f)
+        px_f.pack(side="left")
+        ttk.Label(px_f, text="单像素距离(um):").pack(side="left")
+        ttk.Entry(px_f, textvariable=self.var_pixel_size, width=6).pack(side="left", padx=(2,0))
+        
         ttk.Checkbutton(f, text="二值化预览", variable=self.var_preview_mode, command=self.upd_view).pack(fill="x", pady=5)
         ttk.Button(f, text="⚡ 生成双模板预览", command=self.analyze_template).pack(fill="x", pady=5)
-        ttk.Button(f, text="💾 保存模板文件", command=self.save_template).pack(fill="x", pady=5)
+        ttk.Button(f, text="💾 保存基础模板文件", command=self.save_template).pack(fill="x", pady=5)
 
     def _init_tab_detect(self, p):
         f = ttk.Frame(p); f.pack(fill="x", padx=10, pady=10)
+        
+        prog_f = ttk.Frame(f)
+        prog_f.pack(fill="x", pady=(0, 10))
+        ttk.Button(prog_f, text="📂 加载程序", command=self.load_program).pack(side="left", fill="x", expand=True, padx=(0, 2))
+        ttk.Button(prog_f, text="💾 保存程序", command=self.save_program).pack(side="left", fill="x", expand=True, padx=(2, 0))
+        
+        ttk.Separator(f).pack(fill="x", pady=5)
+        
         ttk.Button(f, text="📂 加载模板文件", command=self.load_template_file).pack(fill="x")
         ttk.Button(f, text="📂 加载测试文件夹", command=self.load_test_folder).pack(fill="x", pady=5)
         
@@ -335,7 +313,6 @@ class ModernUI(tk.Tk):
         
         ttk.Separator(f).pack(fill="x", pady=10)
         
-        # --- 数据存储与任务令设置 ---
         path_lf = ttk.LabelFrame(f, text=" 检测数据存储设置 ")
         path_lf.pack(fill="x", pady=5)
         
@@ -343,15 +320,20 @@ class ModernUI(tk.Tk):
         task_emp_frame.pack(fill="x", padx=5, pady=(5, 2))
         
         ttk.Label(task_emp_frame, text="任务令:").pack(side="left")
-        ttk.Entry(task_emp_frame, textvariable=self.var_task_order, width=12).pack(side="left", padx=(2, 10))
+        self.entry_task = tk.Entry(task_emp_frame, textvariable=self.var_task_order, width=12, font=("Segoe UI", 10))
+        self.entry_task.pack(side="left", padx=(2, 10))
         
         ttk.Label(task_emp_frame, text="测试员工号:").pack(side="left")
-        ttk.Entry(task_emp_frame, textvariable=self.var_emp_id, width=10).pack(side="left", padx=(2, 0))
+        self.entry_emp = tk.Entry(task_emp_frame, textvariable=self.var_emp_id, width=10, font=("Segoe UI", 10))
+        self.entry_emp.pack(side="left", padx=(2, 0))
 
         ttk.Button(path_lf, text="📁 设置根保存路径", command=self.select_save_path).pack(fill="x", padx=5, pady=2)
-        ttk.Label(path_lf, textvariable=self.var_save_path, foreground="#AAA").pack(fill="x", padx=5, pady=(0,5))
         
-        # --- 扫码触发检测 ---
+        self.lbl_save_path = ttk.Label(path_lf, text="【未设置保存路径】", foreground="red")
+        if self.var_save_path.get():
+            self.lbl_save_path.config(text=self.var_save_path.get(), foreground="#AAA")
+        self.lbl_save_path.pack(fill="x", padx=5, pady=(0,5))
+        
         sn_lf = ttk.LabelFrame(f, text=" 扫码触发检测 (SN输入) ")
         sn_lf.pack(fill="x", pady=5)
         ttk.Button(sn_lf, text="🔍 扫码枪输入 SN (弹窗)", command=self.open_sn_dialog).pack(fill="x", padx=5, pady=5)
@@ -363,9 +345,10 @@ class ModernUI(tk.Tk):
         
         auto_row = ttk.Frame(auto_lf)
         auto_row.pack(fill="x", padx=5, pady=5)
-        ttk.Label(auto_row, text="开启自动检测:").pack(side="left")
-        self.switch_auto = SlideSwitch(auto_row, command=self.on_auto_switch)
-        self.switch_auto.pack(side="right", padx=5)
+        
+        self.var_auto_trigger = tk.BooleanVar(value=False)
+        self.chk_auto = ttk.Checkbutton(auto_row, text="勾选开启自动检测", variable=self.var_auto_trigger, command=self.on_auto_switch)
+        self.chk_auto.pack(side="left")
         
         self.var_delay = tk.DoubleVar(value=0.5)
         tk.Scale(auto_lf, from_=0, to=10, resolution=0.1, orient="h", label="匹配后延迟触发 (0-10s)", variable=self.var_delay, bg="#2E2E2E", fg="white").pack(fill="x", padx=5, pady=2)
@@ -384,21 +367,6 @@ class ModernUI(tk.Tk):
         
         ttk.Separator(f).pack(fill="x", pady=10)
         
-        param_f = ttk.Frame(f)
-        param_f.pack(fill="x", pady=10)
-        
-        # 偏移合格阈值输入框
-        dist_f = ttk.Frame(param_f)
-        dist_f.pack(side="left", padx=(0, 10))
-        ttk.Label(dist_f, text="偏移合格阈值(um):").pack(side="left")
-        ttk.Entry(dist_f, textvariable=self.var_dist_thresh, width=6).pack(side="left", padx=(2,0))
-        
-        # 单像素物理距离输入框
-        px_f = ttk.Frame(param_f)
-        px_f.pack(side="left")
-        ttk.Label(px_f, text="单像素距离(um):").pack(side="left")
-        ttk.Entry(px_f, textvariable=self.var_pixel_size, width=6).pack(side="left", padx=(2,0))
-
         ttk.Button(f, text="🔍 开始手动检测", command=self.run_detection).pack(fill="x", pady=15)
 
     def toggle_camera(self):
@@ -424,6 +392,7 @@ class ModernUI(tk.Tk):
             if not self.preview_live:
                 logger.info("恢复相机实时预览")
                 self.preview_live = True
+                self.showing_result = False
                 self.lbl_status.config(text="已恢复实时预览")
                 self.engine.detect_results = []
                 self.redraw_overlays()
@@ -440,7 +409,22 @@ class ModernUI(tk.Tk):
             if ret and frame is not None:
                 self.latest_frame = frame
                 
-                if self.auto_trigger_on and self.engine.marks:
+                if getattr(self, 'showing_result', False) and self.engine.marks:
+                    now = time.time()
+                    if now - getattr(self, 'last_move_check_time', 0) >= 0.5:
+                        self.last_move_check_time = now
+                        matched, _ = self.engine.match_marks(frame, self.var_mark_exp.get())
+                        if not matched: 
+                            logger.info("工件已移出视野，清除结果叠加")
+                            self.showing_result = False
+                            self.engine.detect_results = []
+                            self.redraw_overlays()
+                            self.lbl_status.config(text="工件已移走，画面已清理，等待下一个产品...")
+                            
+                            if self.auto_trigger_on:
+                                self.trigger_cooldown = False
+
+                elif self.auto_trigger_on and self.engine.marks and not getattr(self, 'showing_result', False):
                     now = time.time()
                     if now - self.last_check_time >= 1.0:
                         self.last_check_time = now
@@ -453,15 +437,6 @@ class ModernUI(tk.Tk):
                                 delay_ms = int(self.var_delay.get() * 1000)
                                 self.lbl_status.config(text=f"匹配到Mark，偏移 {offset}，延迟 {delay_ms/1000.0}秒后检测...")
                                 self.after(delay_ms, lambda offset=offset: self.do_auto_trigger(offset))
-                                
-                        elif self.trigger_cooldown:
-                            matched, _ = self.engine.match_marks(frame, self.var_mark_exp.get())
-                            if not matched: 
-                                logger.info("工件已移出视野，重置自动触发状态")
-                                self.trigger_cooldown = False
-                                self.preview_live = True
-                                self.engine.detect_results = []
-                                self.lbl_status.config(text="自动触发已重置，等待新工件进入...")
                 
                 if self.preview_live:
                     self.cv_img = frame.copy()
@@ -479,8 +454,9 @@ class ModernUI(tk.Tk):
             matched, final_offset = self.engine.match_marks(self.cv_img, self.var_mark_exp.get())
             offset_to_use = final_offset if matched else initial_offset
             logger.info(f"执行自动触发检测，最终偏移量: {offset_to_use}")
+            
             self.run_detection(offset=offset_to_use)
-            self.lbl_status.config(text="检测完成，画面已锁定，请等待工件移出视野以重置...")
+            self.lbl_status.config(text="检测完成，本次结果已展示。请将当前工件移走以重置任务...")
             
         self.trigger_waiting = False
         self.trigger_cooldown = True
@@ -491,24 +467,98 @@ class ModernUI(tk.Tk):
             return
             
         self.cv_img = self.latest_frame.copy()
-        if self.is_live: self.preview_live = False
+        
+        if self.sidebar.index("current") == 0:
+            if self.is_live: self.preview_live = False
+            self.lbl_status.config(text="已手动取图，预览画面已锁定（点击相机按钮恢复）。")
             
         self.canvas.load_image(self.cv_img)
         self.redraw_overlays()
-        if not self.auto_trigger_on:
-            logger.info("用户手动截取图像")
-            self.lbl_status.config(text="已手动取图，预览画面已锁定（点击相机按钮恢复）。")
 
         if self.sidebar.index("current") == 1 and not self.auto_trigger_on and not skip_detect:
             self.run_detection()
 
-    # ==========================================
-    # SN扫描与自动图片保存控制逻辑 (基于任务令)
-    # ==========================================
+    def save_program(self):
+        f = filedialog.asksaveasfilename(defaultextension=".json", title="保存程序", filetypes=[("JSON Files", "*.json")])
+        if not f: return
+        try:
+            prog_data = {
+                "templates": self.engine.templates,
+                "test_rois": self.test_rois,
+                "params": {
+                    "s_min": self.s_min.get(),
+                    "s_max": self.s_max.get(),
+                    "s_area": self.s_area.get(),
+                    "edge_min_len": self.s_edge_min_len.get(),
+                    "dist_thresh": self.var_dist_thresh.get(),
+                    "pixel_size": self.var_pixel_size.get(),
+                    "save_path": self.var_save_path.get(),
+                    "delay": self.var_delay.get(),
+                    "mark_exp": self.var_mark_exp.get()
+                }
+            }
+            with open(f, 'w', encoding='utf-8') as file:
+                json.dump(prog_data, file, ensure_ascii=False, indent=2)
+            messagebox.showinfo("成功", "程序保存成功！")
+            logger.info(f"程序保存至: {f}")
+        except Exception as e:
+            logger.error(f"保存程序失败: {e}")
+            messagebox.showerror("错误", f"保存程序失败: {e}")
+
+    def load_program(self):
+        f = filedialog.askopenfilename(title="加载程序", filetypes=[("JSON Files", "*.json")])
+        if not f: return
+        try:
+            with open(f, 'r', encoding='utf-8') as file:
+                prog_data = json.load(file)
+            
+            if "templates" in prog_data and "params" in prog_data:
+                p = prog_data["params"]
+                self.s_min.set(p.get("s_min", 80))
+                self.s_max.set(p.get("s_max", 255))
+                self.s_area.set(p.get("s_area", 10))
+                self.s_edge_min_len.set(p.get("edge_min_len", 20))
+                self.var_dist_thresh.set(p.get("dist_thresh", 50.0))
+                self.var_pixel_size.set(p.get("pixel_size", 5.0))
+                self.var_delay.set(p.get("delay", 0.5))
+                self.var_mark_exp.set(p.get("mark_exp", 20))
+                
+                save_path = p.get("save_path", "")
+                self.var_save_path.set(save_path)
+                if save_path:
+                    self.lbl_save_path.config(foreground="#AAA", text=save_path)
+                else:
+                    self.lbl_save_path.config(foreground="red", text="【未设置保存路径】")
+                
+                self.test_rois = prog_data.get("test_rois", [])
+                
+                self.engine.templates = prog_data["templates"]
+                self.engine.marks = []
+                if 'marks' in self.engine.templates:
+                    for m in self.engine.templates['marks']:
+                        img_cv = self.engine._decode_img(m['img_b64'])
+                        self.engine.marks.append({
+                            'box': m['box'],
+                            'img_cv2': img_cv,
+                            'img_b64': m['img_b64']
+                        })
+                
+                self.mark_boxes = [m['box'] for m in self.engine.marks]
+                self.redraw_overlays()
+                messagebox.showinfo("成功", "程序加载成功，请直接输入任务令与工号进行检测！")
+                self.lbl_status.config(text="程序全部参数与模板已复原")
+            else:
+                messagebox.showwarning("格式不符", "该文件并非完整程序配置，将尝试仅作模板文件加载...")
+                self.load_template_file(f)
+        except Exception as e:
+            logger.error(f"加载程序失败: {e}")
+            messagebox.showerror("错误", f"加载程序失败: {e}")
+
     def select_save_path(self):
         path = filedialog.askdirectory(title="选择检测图片保存根路径")
         if path:
             self.var_save_path.set(path)
+            self.lbl_save_path.config(foreground="#AAA", text=path)
             logger.info(f"图片自动保存根路径已设置为: {path}")
 
     def open_sn_dialog(self):
@@ -522,9 +572,27 @@ class ModernUI(tk.Tk):
 
         self.sn_window = tk.Toplevel(self)
         self.sn_window.title("SN扫码输入")
-        self.sn_window.geometry("400x130")
+        
+        # --- 恢复上一次拖动的位置 ---
+        if self.sn_window_x is not None and self.sn_window_y is not None:
+            # 兼容负坐标与多屏逻辑 (正坐标需补加号，负坐标自带减号)
+            x_str = f"+{self.sn_window_x}" if self.sn_window_x >= 0 else str(self.sn_window_x)
+            y_str = f"+{self.sn_window_y}" if self.sn_window_y >= 0 else str(self.sn_window_y)
+            self.sn_window.geometry(f"400x130{x_str}{y_str}")
+        else:
+            self.sn_window.geometry("400x130")
+            
         self.sn_window.attributes("-topmost", True)
         self.sn_window.transient(self) 
+        
+        # --- 记忆保存：窗口被鼠标直接关闭时 ---
+        def on_sn_close():
+            self.sn_window_x = self.sn_window.winfo_x()
+            self.sn_window_y = self.sn_window.winfo_y()
+            self.sn_window.destroy()
+            self.sn_window = None
+
+        self.sn_window.protocol("WM_DELETE_WINDOW", on_sn_close)
 
         ttk.Label(self.sn_window, text="请使用扫码枪扫描SN (自动回车触发):", font=("Segoe UI", 11)).pack(pady=10)
         self.sn_entry = ttk.Entry(self.sn_window, font=("Segoe UI", 14))
@@ -535,7 +603,14 @@ class ModernUI(tk.Tk):
 
     def on_sn_entered(self, event):
         self.current_sn = self.sn_entry.get().strip()
-        self.sn_window.destroy()
+        
+        # --- 记忆保存：当成功按下回车执行时 ---
+        if self.sn_window:
+            self.sn_window_x = self.sn_window.winfo_x()
+            self.sn_window_y = self.sn_window.winfo_y()
+            self.sn_window.destroy()
+            self.sn_window = None
+            
         self.after(100, self.trigger_sn_detection)
 
     def trigger_sn_detection(self):
@@ -548,7 +623,7 @@ class ModernUI(tk.Tk):
         is_ok = self.run_detection()
 
         if is_ok:
-            self.lbl_status.config(text=f"[{self.current_sn}] 检测OK。请扫描下一个。")
+            self.lbl_status.config(text=f"[{self.current_sn}] 检测OK。已恢复实时画面展示结果，挪走产品并扫下一个。")
             self.current_sn = ""
             self.after(500, self.open_sn_dialog)
         else:
@@ -566,7 +641,6 @@ class ModernUI(tk.Tk):
         if not task_order:
             task_order = "未命名任务"
 
-        # 根据任务令在根目录下创建子文件夹
         task_dir = os.path.join(save_path, task_order)
         raw_dir = os.path.join(task_dir, "raw")
         ok_dir = os.path.join(task_dir, "ok")
@@ -579,11 +653,9 @@ class ModernUI(tk.Tk):
         sn_str = getattr(self, 'current_sn', '')
         file_name = f"{sn_str}_{ts}.jpg" if sn_str else f"{ts}.jpg"
 
-        # 1. 保存原始整版图
         raw_path = os.path.join(raw_dir, file_name)
-        cv2.imwrite(raw_path, self.cv_img)
+        cv2.imencode('.jpg', self.cv_img)[1].tofile(raw_path)
 
-        # 2. 绘制包含结果的图片
         res_img = self.cv_img.copy()
 
         for (x, y, w, h, tid) in self.test_rois:
@@ -610,23 +682,18 @@ class ModernUI(tk.Tk):
                     else:
                         cv2.putText(res_img, "Lost", (px, py-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
-        # 3. 按最终判定存入 OK 或 NG 目录
         target_dir = ok_dir if is_ok else ng_dir
         res_path = os.path.join(target_dir, file_name)
-        cv2.imwrite(res_path, res_img)
+        cv2.imencode('.jpg', res_img)[1].tofile(res_path)
         
         emp_id = self.var_emp_id.get().strip()
         logger.info(f"图片自动归档完成 (任务令: {task_order}, 员工号: {emp_id if emp_id else '无'}): {file_name} -> {target_dir}")
-        
-    # ==========================================
 
     def update_task_stats(self, is_ok):
-        """更新当前任务令的统计情况"""
         current_task = self.var_task_order.get().strip()
         if not current_task:
             current_task = "未命名任务"
             
-        # 如果任务令发生变更，重置统计数据
         if current_task != self.stats_task_order:
             self.stats_task_order = current_task
             self.stats_ok_count = 0
@@ -644,16 +711,14 @@ class ModernUI(tk.Tk):
         
         stats_text = f"任务: {self.stats_task_order} | OK: {self.stats_ok_count} | NG: {self.stats_ng_count} | 总计: {self.stats_total_count}"
         
-        # 更新状态栏右侧统计显示
         self.lbl_stats.config(text=stats_text)
-        
-        # 记录到日志系统
         logger.info(f"【测试统计】{stats_text}{emp_info}")
 
-    def on_auto_switch(self, state):
+    def on_auto_switch(self):
+        state = self.var_auto_trigger.get()
         if state and not self.engine.marks:
             messagebox.showwarning("警告", "当前模板未包含Mark点！请先在模板制作页面绘制并保存包含Mark点的模板。")
-            self.switch_auto.set_state(False)
+            self.var_auto_trigger.set(False)
             self.auto_trigger_on = False
             return
         self.auto_trigger_on = state
@@ -662,6 +727,8 @@ class ModernUI(tk.Tk):
 
     def on_tab_changed(self, e):
         self.draw_mode = None
+        self.showing_result = False
+        self.engine.detect_results = []
         self.lbl_status.config(text="模式切换")
         self.redraw_overlays()
 
@@ -687,7 +754,7 @@ class ModernUI(tk.Tk):
         p = filedialog.askopenfilename()
         if p:
             logger.info(f"加载标准图: {p}")
-            self.cv_img = cv2.imread(p)
+            self.cv_img = cv2.imdecode(np.fromfile(p, dtype=np.uint8), cv2.IMREAD_COLOR)
             self.latest_frame = self.cv_img.copy() 
             self.canvas.load_image(self.cv_img)
             self.clear_tmpl_boxes()
@@ -701,7 +768,12 @@ class ModernUI(tk.Tk):
     def analyze_template(self):
         if self.cv_img is None: return
         self.var_preview_mode.set(False); self.upd_view()
-        params = {"thresh_min": self.s_min.get(), "thresh_max": self.s_max.get(), "area_min": self.s_area.get()}
+        params = {
+            "thresh_min": self.s_min.get(), 
+            "thresh_max": self.s_max.get(), 
+            "area_min": self.s_area.get(),
+            "edge_min_len": self.s_edge_min_len.get()
+        }
         try:
             msg = self.engine.process_all_templates(self.cv_img, self.tmpl_boxes, params)
             self.redraw_overlays()
@@ -719,8 +791,8 @@ class ModernUI(tk.Tk):
             except Exception as e: 
                 messagebox.showerror("Err", str(e))
 
-    def load_template_file(self):
-        f = filedialog.askopenfilename()
+    def load_template_file(self, filepath=None):
+        f = filepath or filedialog.askopenfilename(filetypes=[("JSON Files", "*.json")])
         if f:
             ok, msg = self.engine.load_template_file(f)
             self.mark_boxes = [m['box'] for m in self.engine.marks]
@@ -763,7 +835,7 @@ class ModernUI(tk.Tk):
     def _load_test_img(self):
         p = self.test_img_list[self.curr_idx]
         logger.info(f"加载测试图像: {p}")
-        self.cv_img = cv2.imread(p)
+        self.cv_img = cv2.imdecode(np.fromfile(p, dtype=np.uint8), cv2.IMREAD_COLOR)
         self.latest_frame = self.cv_img.copy()
         self.canvas.load_image(self.cv_img)
         self.test_rois = []
@@ -774,9 +846,43 @@ class ModernUI(tk.Tk):
     def clear_test_boxes(self):
         self.test_rois = []
         self.engine.detect_results = []
+        self.showing_result = False
         self.redraw_overlays()
 
     def run_detection(self, offset=(0,0)):
+        task = self.var_task_order.get().strip()
+        emp = self.var_emp_id.get().strip()
+        path = self.var_save_path.get().strip()
+        
+        valid = True
+        if not task:
+            self.entry_task.config(bg="#FFCCCC")
+            valid = False
+        else:
+            self.entry_task.config(bg="white")
+            
+        if not emp:
+            self.entry_emp.config(bg="#FFCCCC")
+            valid = False
+        else:
+            self.entry_emp.config(bg="white")
+            
+        if not path:
+            self.lbl_save_path.config(foreground="red", text="【未设置保存路径 - 点击上方按钮设置】")
+            valid = False
+        else:
+            self.lbl_save_path.config(foreground="#AAA", text=path)
+            
+        if not valid:
+            if not getattr(self, '_alerted_missing_fields', False):
+                messagebox.showerror("禁止检测", "请先输入任务令、测试员工号，并设置保存路径！\n缺失项已标红提示。")
+                self._alerted_missing_fields = True 
+                self.after(3000, lambda: setattr(self, '_alerted_missing_fields', False))
+            if self.auto_trigger_on:
+                self.var_auto_trigger.set(False)
+                self.on_auto_switch()
+            return False
+
         if self.cv_img is None or not self.test_rois: return False
         try:
             res = self.engine.detect_batch_process(
@@ -794,15 +900,16 @@ class ModernUI(tk.Tk):
             result_txt = f"检测完成 | 全部OK的产品数: {ok_cnt} / {len(res)}"
             logger.info(result_txt)
             
-            # 保存图片归档
             self.save_detection_images(is_all_ok)
-            
-            # 同步更新统计情况
             self.update_task_stats(is_all_ok)
             
-            # 不影响原有的手动测试/非扫码状态显示
+            if self.is_live:
+                self.preview_live = True
+                self.showing_result = True
+                self.last_move_check_time = time.time()
+                
             if not getattr(self, 'current_sn', '') and not self.auto_trigger_on:
-                self.lbl_status.config(text=result_txt)
+                self.lbl_status.config(text=result_txt + " (检测完毕，请将工件移出视野)")
                 
             return is_all_ok
         except Exception as e:
