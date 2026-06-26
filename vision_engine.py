@@ -111,7 +111,7 @@ class VisionEngine:
         found_frames = []
         for fx, fy, fw, fh in frame_boxes:
             roi = img[fy:fy+fh, fx:fx+fw]
-            edge_box = self._find_edges_scanline(roi, params['thresh_min'])
+            edge_box = self._find_edges_scanline(roi, params['thresh_min'], params.get('edge_min_len', 20))
             if edge_box:
                 found_frames.append((fx + edge_box[0], fy + edge_box[1], edge_box[2], edge_box[3]))
         if not found_frames: 
@@ -185,6 +185,10 @@ class VisionEngine:
         ox, oy = offset
         logger.info(f"开始批量检测，接收到 {len(rois_with_ids)} 个检测框，偏移量 {offset}")
         
+        if pixel_size <= 0: pixel_size = 1.0 
+        margin_px = int(dist_thresh / pixel_size)
+        search_margin = max(20, margin_px + 10) 
+        
         for (rx_o, ry_o, rw, rh, tmpl_id) in rois_with_ids:
             rx = int(rx_o + ox)
             ry = int(ry_o + oy)
@@ -199,7 +203,7 @@ class VisionEngine:
                 
             params = tmpl_data['params']
             roi_img = img[ry:ry+rh, rx:rx+rw]
-            edge_box_rel = self._find_edges_scanline(roi_img, params['thresh_min'])
+            edge_box_rel = self._find_edges_scanline(roi_img, params['thresh_min'], params.get('edge_min_len', 20))
             
             if not edge_box_rel:
                 logger.warning(f"模板 {tmpl_id} 在检测区未找到基准边")
@@ -217,7 +221,7 @@ class VisionEngine:
                 pred_cx, pred_cy = actual_center[0] + vx, actual_center[1] + vy
                 pred_box = (int(pred_cx - w_tmpl/2), int(pred_cy - h_tmpl/2), int(w_tmpl), int(h_tmpl))
                 
-                margin = 20
+                margin = search_margin
                 sx = max(0, int(pred_box[0] - margin)); sy = max(0, int(pred_box[1] - margin))
                 sw = int(pred_box[2] + margin*2); sh = int(pred_box[3] + margin*2)
                 sx = min(sx, img.shape[1]-1); sy = min(sy, img.shape[0]-1)
@@ -228,7 +232,6 @@ class VisionEngine:
                 final_box, dist_um = None, float('inf')
                 if cands:
                     pred_rel = (pred_box[0]-sx, pred_box[1]-sy, pred_box[2], pred_box[3])
-                    # 匹配中心点距离最小的候选框
                     best_c = min(cands, key=lambda c: self.calculate_center_distance(pred_rel, c))
                     pixel_dist = self.calculate_center_distance(pred_rel, best_c)
                     dist_um = pixel_dist * pixel_size
@@ -241,29 +244,48 @@ class VisionEngine:
             self.detect_results.append(prod_res)
         return self.detect_results
 
-    def _find_edges_scanline(self, roi, thresh_val):
+    def _find_edges_scanline(self, roi, thresh_val, edge_min_len=20):
         h, w = roi.shape[:2]
         if h < 10 or w < 10: return None
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (3, 3), 0)
         _, binary = cv2.threshold(blurred, int(thresh_val), 255, cv2.THRESH_BINARY)
-        def find_falling_edge(arr):
-            diff = np.diff(arr.astype(np.int16))
-            idx = np.where(diff < -100)[0]
-            return idx[0] if len(idx) > 0 else None
-
-        skip = 2; mid_y, mid_x = h // 2, w // 2
-        line_l = np.max(binary[max(0, mid_y-1):min(h, mid_y+2), :], axis=0)
-        idx = find_falling_edge(line_l[skip:])
-        lx = (idx + skip) if idx is not None else 0
-        idx = find_falling_edge(line_l[::-1][skip:])
-        rx = (w - 1 - (idx + skip)) if idx is not None else w - 1
         
-        line_b = np.max(binary[:, max(0, mid_x-1):min(w, mid_x+2)], axis=1)
-        idx = find_falling_edge(line_b[::-1][skip:])
-        by = (h - 1 - (idx + skip)) if idx is not None else h - 1
-        idx = find_falling_edge(np.max(binary[:, max(0, w//3-1):min(w, w//3+2)], axis=1)[skip:])
-        ty = (idx + skip) if idx is not None else 0
+        # 计算指定数组中“连续暗像素(即产品本身)”的最大长度
+        def get_max_continuous_zeros(arr):
+            is_zero = (arr < 128)
+            if not np.any(is_zero): return 0
+            padded = np.pad(is_zero, (1, 1), 'constant', constant_values=False)
+            diff = np.diff(padded.astype(int))
+            starts = np.where(diff == 1)[0]
+            ends = np.where(diff == -1)[0]
+            return np.max(ends - starts)
+
+        lx, rx, ty, by = 0, w - 1, 0, h - 1
+        
+        # 从左外侧向内搜索
+        for x in range(2, w):
+            if get_max_continuous_zeros(binary[:, x]) >= edge_min_len:
+                lx = x
+                break
+        
+        # 从右外侧向内搜索
+        for x in range(w - 3, -1, -1):
+            if get_max_continuous_zeros(binary[:, x]) >= edge_min_len:
+                rx = x
+                break
+                
+        # 从上外侧向内搜索
+        for y in range(2, h):
+            if get_max_continuous_zeros(binary[y, :]) >= edge_min_len:
+                ty = y
+                break
+                
+        # 从下外侧向内搜索
+        for y in range(h - 3, -1, -1):
+            if get_max_continuous_zeros(binary[y, :]) >= edge_min_len:
+                by = y
+                break
 
         if rx - lx < 5 or by - ty < 5: return None
         return (int(lx), int(ty), int(rx - lx), int(by - ty))
