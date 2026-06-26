@@ -9,15 +9,10 @@ import logging
 # 获取独立的 logger
 logger = logging.getLogger("CameraManager")
 
-# ==========================================
-# 动态加载子目录中的 OPT SDK
-# ==========================================
 # 判断是否被 PyInstaller 打包
 if getattr(sys, 'frozen', False):
-    # 打包模式：SDK 位于临时目录 sys._MEIPASS 中
     base_dir = sys._MEIPASS
 else:
-    # 开发模式：SDK 位于当前脚本所在目录
     base_dir = os.path.dirname(os.path.abspath(__file__))
 
 sdk_path = os.path.join(base_dir, "Python")
@@ -83,6 +78,12 @@ class OptCamera:
                 raise Exception(f"调用 API 失败，错误码: {reVal}")
                 
             time.sleep(0.2)
+            
+            # --- 修复高延迟：将抓取策略设为最新帧(Latest)，避免队列积压 ---
+            step = "设置拉流策略"
+            reVal = self.m_cam.SciCam_SetGrabStrategy(1) # 1 为 SciCam_GrabStrategy_Latest
+            if reVal != SCI_CAMERA_OK:
+                logger.warning(f"设置拉流策略失败: {reVal}")
                 
             step = "开启拉流(StartGrabbing)"
             reVal = self.m_cam.SciCam_StartGrabbing()
@@ -178,8 +179,11 @@ class OptCamera:
     def release(self):
         if self._is_opened and self.m_cam is not None:
             try:
+                # --- 修复重新开启卡死：添加适度延迟释放设备，防止线程资源抢占 ---
                 self.m_cam.SciCam_StopGrabbing()
+                time.sleep(0.1)
                 self.m_cam.SciCam_CloseDevice()
+                time.sleep(0.1)
                 self.m_cam.SciCam_DeleteDevice()
                 logger.info("OPT 相机资源已释放")
             except Exception as e:
